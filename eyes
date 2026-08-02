@@ -786,7 +786,8 @@ def cmd_tunnel_setup(args):
     r = _cfd("tunnel", "list", "--output", "json")
     if r.returncode != 0:
         sys.exit("eyes: cloudflared tunnel list failed:\n" + r.stderr.strip())
-    existing = {t["name"]: t["id"] for t in json.loads(r.stdout or "[]")}
+    # cloudflared emits JSON `null` (not `[]`) when the account has no tunnels
+    existing = {t["name"]: t["id"] for t in (json.loads(r.stdout or "[]") or [])}
     if name in existing:
         tid = existing[name]
         print(f"tunnel '{name}' already exists ({tid})")
