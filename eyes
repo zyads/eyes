@@ -1,0 +1,1019 @@
+#!/usr/bin/env python3
+"""eyes — point your phone camera at the world, frames land on disk.
+
+A local-first way to give a terminal AI agent (or anything that can read a
+file) live eyes: your iPhone opens a web page served from this machine, and
+every captured frame is written to a stable path
+(~/.local/state/eyes/latest.jpg) with an atomic replace, plus a rolling
+timestamped history. No app, no App Store, no cloud storage.
+
+Zero dependencies: Python stdlib + the system `openssl` binary (cert
+generation) + libcrypto via ctypes (AES-GCM). The phone side is one
+self-contained HTML page (inlined below, no CDN assets).
+
+Two modes:
+
+  LAN (default)   — HTTPS on your LAN address with a locally generated CA.
+                    Nothing ever leaves your network.
+
+  remote (opt-in) — a Cloudflare Tunnel (outbound-only, no port forwarding)
+                    exposes the page at your own hostname. Frames are
+                    END-TO-END ENCRYPTED in the browser (WebCrypto
+                    AES-256-GCM) with a key carried in the URL *fragment* —
+                    browsers never send the fragment to the server, so the
+                    key never reaches Cloudflare and the tunnel only ever
+                    relays ciphertext. Decryption happens here, on disk
+                    frames are plain JPEGs.
+
+Usage:
+    eyes serve [--port 8443] [--bind IP] [--remote] [--fresh-token]
+    eyes latest                     # print path of the newest frame
+    eyes wait [--timeout SECS]      # block until a NEW frame arrives
+    eyes gc [--keep N] [--max-mb M] # prune history, printing what goes
+    eyes tunnel setup HOSTNAME      # one-time Cloudflare Tunnel setup
+    eyes tunnel up|down|status      # start/stop the tunnel (user systemd)
+
+Why HTTPS + a private CA on the LAN: iOS Safari refuses to expose
+navigator.mediaDevices (camera) unless the page is a *fully trusted* secure
+context — merely tapping through a self-signed-cert warning is NOT enough on
+iOS. So `eyes` generates a local CA once, issues a leaf cert for the LAN IP,
+and the phone page walks you through trusting the CA (a one-time ~60s dance
+in iOS Settings). When the LAN IP changes, only the leaf is re-issued — no
+re-trusting. In remote mode Cloudflare's edge presents a real publicly
+trusted certificate, so none of this is needed on the phone.
+
+Security model (full version in the README): LAN-address bind only, an
+unguessable token on every path, size-capped uploads that must parse as
+JPEG/encrypted-frame, a global rate limit, capped history. Remote mode adds
+Cloudflare Access (login wall) + the app token + the E2E key, and refuses
+plaintext frames entirely.
+"""
+
+import argparse
+import base64
+import ctypes
+import ctypes.util
+import hmac
+import json
+import os
+import secrets
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+STATE = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "eyes"
+)
+HISTORY = os.path.join(STATE, "history")
+LATEST = os.path.join(STATE, "latest.jpg")
+TOKEN_FILE = os.path.join(STATE, "token")
+E2E_KEY_FILE = os.path.join(STATE, "e2e.key")
+CA_CERT = os.path.join(STATE, "ca.pem")
+CA_KEY = os.path.join(STATE, "ca.key")
+LEAF_CERT = os.path.join(STATE, "leaf.pem")
+LEAF_KEY = os.path.join(STATE, "leaf.key")
+CHAIN = os.path.join(STATE, "chain.pem")
+CERT_META = os.path.join(STATE, "cert-meta.json")
+TUNNEL_META = os.path.join(STATE, "tunnel.json")
+TUNNEL_YML = os.path.join(STATE, "tunnel.yml")
+UNIT_NAME = "eyes-tunnel.service"
+UNIT_FILE = os.path.expanduser("~/.config/systemd/user/" + UNIT_NAME)
+
+MAGIC = b"EYE1"                 # prefix of an encrypted frame
+MAX_UPLOAD = 10 * 1024 * 1024   # 10 MB per frame — far above any phone JPEG
+MAX_FPS = 8                     # global rate limit, frames per second
+KEEP_COUNT = 500                # history cap: number of frames
+KEEP_BYTES = 200 * 1024 * 1024  # history cap: total size
+GC_EVERY = 25                   # auto-gc every N frames while serving
+
+# ------------------------------------------------------------------ state/dirs
+
+
+def ensure_state():
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    os.makedirs(HISTORY, mode=0o700, exist_ok=True)
+    os.chmod(STATE, 0o700)
+
+
+def _write_secret(path, text):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text + "\n")
+
+
+def get_token(fresh=False):
+    if not fresh and os.path.exists(TOKEN_FILE):
+        tok = open(TOKEN_FILE).read().strip()
+        if tok:
+            return tok
+    tok = secrets.token_urlsafe(16)
+    _write_secret(TOKEN_FILE, tok)
+    return tok
+
+
+def get_e2e_key(create=False):
+    """32-byte AES key, stored base64url. Carried to the phone in the URL
+    *fragment* only — the fragment is never sent in HTTP requests, so no
+    intermediary (including Cloudflare) ever sees it."""
+    if os.path.exists(E2E_KEY_FILE):
+        raw = base64.urlsafe_b64decode(open(E2E_KEY_FILE).read().strip() + "==")
+        if len(raw) == 32:
+            return raw
+    if not create:
+        return None
+    raw = secrets.token_bytes(32)
+    _write_secret(E2E_KEY_FILE, base64.urlsafe_b64encode(raw).decode().rstrip("="))
+    return raw
+
+
+def b64u(raw):
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def lan_ip():
+    """Best-effort LAN address. UDP connect() sends no packets — it only asks
+    the kernel which source address would be used for that route."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("192.0.2.1", 9))  # TEST-NET-1, never actually contacted
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+# ------------------------------------------------------- AES-256-GCM (libcrypto)
+# WebCrypto on the phone speaks AES-GCM natively; Python's stdlib has no AES,
+# so we call the system libcrypto directly through ctypes (same spirit as
+# using the system openssl binary — no pip packages). WebCrypto's ciphertext
+# layout is ct||tag with a 16-byte tag, which is exactly EVP's.
+
+_EVP_CTRL_AEAD_SET_IVLEN, _EVP_CTRL_AEAD_GET_TAG, _EVP_CTRL_AEAD_SET_TAG = 0x9, 0x10, 0x11
+
+
+class GCM:
+    def __init__(self):
+        name = ctypes.util.find_library("crypto") or "libcrypto.so.3"
+        L = ctypes.CDLL(name)
+        L.EVP_CIPHER_CTX_new.restype = ctypes.c_void_p
+        L.EVP_aes_256_gcm.restype = ctypes.c_void_p
+        P, I = ctypes.c_void_p, ctypes.c_int
+        buf, ip = ctypes.c_char_p, ctypes.POINTER(I)
+        L.EVP_CIPHER_CTX_free.argtypes = [P]
+        L.EVP_CIPHER_CTX_ctrl.argtypes = [P, I, I, P]
+        for f in (L.EVP_EncryptInit_ex, L.EVP_DecryptInit_ex):
+            f.argtypes = [P, P, P, buf, buf]
+        for f in (L.EVP_EncryptUpdate, L.EVP_DecryptUpdate):
+            f.argtypes = [P, ctypes.c_void_p, ip, buf, I]
+        for f in (L.EVP_EncryptFinal_ex, L.EVP_DecryptFinal_ex):
+            f.argtypes = [P, ctypes.c_void_p, ip]
+        self.L = L
+
+    def open(self, key, iv, ct_tag):
+        """Decrypt+authenticate WebCrypto AES-GCM output. None on failure."""
+        if len(ct_tag) < 16:
+            return None
+        ct, tag = ct_tag[:-16], ct_tag[-16:]
+        L = self.L
+        ctx = L.EVP_CIPHER_CTX_new()
+        try:
+            out = ctypes.create_string_buffer(max(len(ct), 1))
+            outl, finl = ctypes.c_int(0), ctypes.c_int(0)
+            fin = ctypes.create_string_buffer(16)
+            if not (
+                L.EVP_DecryptInit_ex(ctx, L.EVP_aes_256_gcm(), None, None, None)
+                and L.EVP_CIPHER_CTX_ctrl(ctx, _EVP_CTRL_AEAD_SET_IVLEN, len(iv), None)
+                and L.EVP_DecryptInit_ex(ctx, None, None, key, iv)
+                and L.EVP_DecryptUpdate(ctx, out, ctypes.byref(outl), ct, len(ct))
+                and L.EVP_CIPHER_CTX_ctrl(
+                    ctx, _EVP_CTRL_AEAD_SET_TAG, 16, ctypes.c_char_p(tag)
+                )
+                and L.EVP_DecryptFinal_ex(ctx, fin, ctypes.byref(finl)) == 1
+            ):
+                return None
+            return out.raw[: outl.value]
+        finally:
+            L.EVP_CIPHER_CTX_free(ctx)
+
+    def seal(self, key, iv, pt):
+        """Encrypt like WebCrypto would (ct||tag). Used by the self-tests."""
+        L = self.L
+        ctx = L.EVP_CIPHER_CTX_new()
+        try:
+            out = ctypes.create_string_buffer(max(len(pt), 1))
+            outl, finl = ctypes.c_int(0), ctypes.c_int(0)
+            fin = ctypes.create_string_buffer(16)
+            tag = ctypes.create_string_buffer(16)
+            assert (
+                L.EVP_EncryptInit_ex(ctx, L.EVP_aes_256_gcm(), None, None, None)
+                and L.EVP_CIPHER_CTX_ctrl(ctx, _EVP_CTRL_AEAD_SET_IVLEN, len(iv), None)
+                and L.EVP_EncryptInit_ex(ctx, None, None, key, iv)
+                and L.EVP_EncryptUpdate(ctx, out, ctypes.byref(outl), pt, len(pt))
+                and L.EVP_EncryptFinal_ex(ctx, fin, ctypes.byref(finl))
+                and L.EVP_CIPHER_CTX_ctrl(ctx, _EVP_CTRL_AEAD_GET_TAG, 16, tag)
+            )
+            return out.raw[: outl.value] + tag.raw
+        finally:
+            L.EVP_CIPHER_CTX_free(ctx)
+
+
+# ----------------------------------------------------------------------- certs
+
+
+def _openssl(*args, **kw):
+    return subprocess.run(
+        ("openssl",) + args, check=True, capture_output=True, text=True, **kw
+    )
+
+
+def ensure_ca():
+    """One local CA, generated once, valid 10 years. The phone trusts this
+    once; leaf certs can then change freely (e.g. when the LAN IP changes)."""
+    if os.path.exists(CA_CERT) and os.path.exists(CA_KEY):
+        return False
+    _openssl(
+        "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "3650",
+        "-nodes", "-keyout", CA_KEY, "-out", CA_CERT,
+        "-subj", "/CN=eyes local CA/O=eyes",
+        "-addext", "basicConstraints=critical,CA:true",
+        "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+    )
+    os.chmod(CA_KEY, 0o600)
+    return True
+
+
+def ensure_leaf(ip):
+    """Issue (or re-issue) the server cert so it covers `ip`. Keeps within
+    Apple's TLS rules: <=825-day validity, SAN present, EKU serverAuth."""
+    sans = ["IP:127.0.0.1", "DNS:localhost"]
+    if ip and "IP:" + ip not in sans:
+        sans.append("IP:" + ip)
+    try:
+        meta = json.load(open(CERT_META))
+    except (OSError, ValueError):
+        meta = {}
+    if (
+        os.path.exists(LEAF_CERT)
+        and os.path.exists(LEAF_KEY)
+        and os.path.exists(CHAIN)
+        and meta.get("sans") == sans
+    ):
+        return False
+    csr = os.path.join(STATE, "leaf.csr")
+    ext = os.path.join(STATE, "leaf.ext")
+    with open(ext, "w") as f:
+        f.write(
+            "subjectAltName=" + ",".join(sans) + "\n"
+            "basicConstraints=CA:false\n"
+            "keyUsage=digitalSignature,keyEncipherment\n"
+            "extendedKeyUsage=serverAuth\n"
+        )
+    _openssl(
+        "req", "-new", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", LEAF_KEY, "-out", csr, "-subj", "/CN=eyes",
+    )
+    _openssl(
+        "x509", "-req", "-in", csr, "-CA", CA_CERT, "-CAkey", CA_KEY,
+        "-CAcreateserial", "-days", "800", "-sha256", "-out", LEAF_CERT,
+        "-extfile", ext,
+    )
+    os.chmod(LEAF_KEY, 0o600)
+    with open(CHAIN, "w") as f:
+        f.write(open(LEAF_CERT).read())
+        f.write(open(CA_CERT).read())
+    with open(CERT_META, "w") as f:
+        json.dump({"sans": sans, "issued": int(time.time())}, f)
+    for p in (csr, ext):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    return True
+
+
+# ---------------------------------------------------------------- frame writes
+
+
+_write_lock = threading.Lock()
+_frame_count = 0
+
+
+def save_frame(data):
+    """Write one frame: timestamped history file + atomic update of latest.jpg.
+
+    A reader of latest.jpg can never see a torn file: bytes go to a temp file
+    first, then os.replace() (atomic on POSIX) swaps it in. latest.jpg is a
+    hardlink to the history file, so the bytes are stored once."""
+    global _frame_count
+    ts = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
+    hist = os.path.join(HISTORY, f"frame-{ts}-{secrets.token_hex(2)}.jpg")
+    tmp = os.path.join(STATE, f".tmp-{os.getpid()}-{secrets.token_hex(4)}")
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, hist)
+    tmp2 = tmp + "L"
+    os.link(hist, tmp2)
+    os.replace(tmp2, LATEST)
+    with _write_lock:
+        _frame_count += 1
+        if _frame_count % GC_EVERY == 0:
+            gc(KEEP_COUNT, KEEP_BYTES, quiet=True)
+    return hist
+
+
+def gc(keep_count=KEEP_COUNT, keep_bytes=KEEP_BYTES, quiet=False):
+    """Prune oldest history frames beyond the caps. Prints what it removes
+    (a summary when called from the server, per-file when run as `eyes gc`)."""
+    try:
+        entries = sorted(
+            (e for e in os.scandir(HISTORY) if e.name.startswith("frame-")),
+            key=lambda e: e.name,
+        )
+    except FileNotFoundError:
+        return 0
+    total = sum(e.stat().st_size for e in entries)
+    removed, freed = 0, 0
+    while entries and (len(entries) > keep_count or total > keep_bytes):
+        e = entries.pop(0)
+        size = e.stat().st_size
+        if not quiet:
+            print(f"removed {e.path} ({size / 1024:.0f} KB)")
+        os.remove(e.path)
+        total -= size
+        removed += 1
+        freed += size
+    if removed and quiet:
+        print(f"gc: pruned {removed} old frames ({freed / 1024 / 1024:.1f} MB)")
+    return removed
+
+
+# ------------------------------------------------------------------ phone page
+
+
+PAGE = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>eyes</title>
+<style>
+:root{color-scheme:dark}
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;background:#000;color:#eee;
+  font:16px/1.4 -apple-system,system-ui,sans-serif;overflow:hidden}
+body{display:flex;flex-direction:column}
+#stage{flex:1;position:relative;min-height:0}
+video{width:100%;height:100%;object-fit:contain;background:#000}
+#flash{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none;
+  transition:opacity .25s}
+#status{position:absolute;top:env(safe-area-inset-top,8px);left:0;right:0;
+  text-align:center;font-size:14px;padding:6px}
+#status span{background:rgba(0,0,0,.6);border-radius:12px;padding:4px 12px}
+#dot{display:inline-block;width:9px;height:9px;border-radius:50%;
+  background:#666;margin-right:6px;vertical-align:1px}
+#dot.ok{background:#3fb950}#dot.bad{background:#f85149}
+#e2e{color:#3fb950;font-weight:600;margin-left:6px;display:none}
+#bar{display:flex;align-items:center;justify-content:space-around;gap:8px;
+  padding:14px 12px calc(14px + env(safe-area-inset-bottom,0px));background:#111}
+button,select{font:inherit;color:#eee;background:#222;border:1px solid #444;
+  border-radius:14px;min-height:60px;min-width:60px;padding:0 14px}
+button:active{background:#333}
+#snap{width:86px;height:86px;min-width:86px;border-radius:50%;background:#eee;
+  border:5px solid #666;color:#000;font-weight:700}
+#snap:active{background:#bbb}
+#stream.on{background:#a42;border-color:#d75}
+#start{position:absolute;inset:0;margin:auto;width:78%;height:96px;
+  font-size:22px;background:#1a3a5c;border-color:#2d6da3}
+#certpanel{position:absolute;inset:0;background:#000;padding:28px 22px;
+  overflow-y:auto;display:none}
+#certpanel h2{margin-bottom:14px}
+#certpanel ol{margin:14px 0 18px 22px}
+#certpanel li{margin-bottom:10px}
+#certpanel a.dl{display:block;text-align:center;background:#1a3a5c;
+  border:1px solid #2d6da3;border-radius:14px;padding:18px;color:#eee;
+  font-size:18px;text-decoration:none;margin-bottom:16px}
+.hide{display:none!important}
+</style></head><body>
+<div id="stage">
+  <video id="video" playsinline autoplay muted></video>
+  <div id="flash"></div>
+  <div id="status"><span><i id="dot"></i><span id="msg">connecting…</span><span id="e2e">E2E</span></span></div>
+  <button id="start">Start camera</button>
+  <div id="certpanel">
+    <h2>One-time setup: trust this machine</h2>
+    <p>iOS only allows camera access on pages it fully trusts, so install the
+    local certificate (takes about a minute, once ever):</p>
+    <a class="dl" href="ca" download="eyes-ca.pem">1 · Download certificate</a>
+    <ol>
+      <li>Tap <b>Allow</b> when Safari asks to download a configuration profile.</li>
+      <li>Open <b>Settings</b> → <b>Profile Downloaded</b> → <b>Install</b>.</li>
+      <li>Then <b>Settings → General → About → Certificate Trust Settings</b>
+          → turn ON <b>eyes local CA</b>.</li>
+      <li>Come back to Safari and reload this page.</li>
+    </ol>
+    <p style="color:#888">The certificate only vouches for this one machine on
+    your own network. Nothing leaves your LAN.</p>
+  </div>
+</div>
+<div id="bar">
+  <button id="flip">Flip</button>
+  <button id="snap">SNAP</button>
+  <button id="stream">Stream</button>
+  <select id="fps"><option value="0.5">0.5 fps</option><option value="1">1 fps</option>
+    <option value="2" selected>2 fps</option><option value="4">4 fps</option></select>
+</div>
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+const video=$("video"),msg=$("msg"),dot=$("dot");
+let stream=null,facing="environment",on=false,busy=false,sent=0,timer=null,
+  wl=null,ekey=null;
+
+function status(t,bad){msg.textContent=t;dot.className=bad?"bad":"ok";}
+function flash(){const f=$("flash");f.style.opacity=.7;
+  setTimeout(()=>f.style.opacity=0,80);}
+
+// End-to-end encryption: the key rides in the URL fragment (#k=…), which the
+// browser never sends over the network — the server printed it, only this
+// page ever sees it. Frames become EYE1 || 12-byte IV || AES-256-GCM(ct||tag).
+async function initKey(){
+  const m=location.hash.match(/k=([A-Za-z0-9_-]+)/);
+  if(!m)return;
+  let s=m[1].replace(/-/g,"+").replace(/_/g,"/");
+  s+="=".repeat((4-s.length%4)%4);
+  const raw=Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+  ekey=await crypto.subtle.importKey("raw",raw,"AES-GCM",false,["encrypt"]);
+  $("e2e").style.display="inline";
+}
+
+async function seal(blob){
+  if(!ekey)return blob;
+  const iv=crypto.getRandomValues(new Uint8Array(12));
+  const ct=new Uint8Array(
+    await crypto.subtle.encrypt({name:"AES-GCM",iv:iv},ekey,
+      await blob.arrayBuffer()));
+  const out=new Uint8Array(16+ct.length);
+  out.set([69,89,69,49]);out.set(iv,4);out.set(ct,16);
+  return new Blob([out],{type:"application/octet-stream"});
+}
+
+async function ping(){
+  try{const r=await fetch("ping",{cache:"no-store"});
+    status(r.ok?"server reachable":"server error "+r.status,!r.ok);}
+  catch(e){status("cannot reach server",true);}
+}
+
+async function startCam(){
+  if(stream)stream.getTracks().forEach(t=>t.stop());
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({audio:false,
+      video:{facingMode:facing,width:{ideal:1920},height:{ideal:1080}}});
+    video.srcObject=stream;await video.play();
+    $("start").classList.add("hide");
+    status("camera on · "+video.videoWidth+"×"+video.videoHeight);
+  }catch(e){status("camera: "+e.name,true);}
+}
+
+function grab(q){return new Promise(res=>{
+  const c=document.createElement("canvas");
+  c.width=video.videoWidth;c.height=video.videoHeight;
+  c.getContext("2d").drawImage(video,0,0);
+  c.toBlob(res,"image/jpeg",q);});}
+
+async function send(blob){
+  const body=await seal(blob);
+  const r=await fetch("frame",{method:"POST",
+    headers:{"Content-Type":body.type||"image/jpeg"},body:body});
+  if(!r.ok)throw new Error("HTTP "+r.status);
+  return blob.size;
+}
+
+async function snap(){
+  if(!stream)return;
+  flash();
+  try{const b=await grab(.9);const s=await send(b);sent++;
+    status("snap sent · "+((s/1024)|0)+" KB · #"+sent);}
+  catch(e){status("send failed: "+e.message,true);}
+}
+
+async function tick(){
+  if(!on)return;
+  if(!busy&&stream&&!document.hidden){
+    busy=true;
+    try{const b=await grab(.7);const s=await send(b);sent++;
+      status("streaming · #"+sent+" · "+((s/1024)|0)+" KB");}
+    catch(e){status("send failed: "+e.message,true);}
+    busy=false;
+  }
+  timer=setTimeout(tick,1000/parseFloat($("fps").value));
+}
+
+async function lock(){try{wl=await navigator.wakeLock.request("screen");}catch(e){}}
+
+function setStream(v){
+  on=v;$("stream").classList.toggle("on",on);
+  $("stream").textContent=on?"Stop":"Stream";
+  if(on){lock();tick();}
+  else{clearTimeout(timer);if(wl){wl.release();wl=null;}status("stream stopped");}
+}
+
+$("start").onclick=startCam;
+$("snap").onclick=snap;
+$("stream").onclick=()=>setStream(!on);
+$("flip").onclick=()=>{facing=facing==="environment"?"user":"environment";
+  if(stream)startCam();};
+document.addEventListener("visibilitychange",()=>{
+  if(!document.hidden&&on)lock();});
+
+if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
+  $("certpanel").style.display="block";$("start").classList.add("hide");
+}
+initKey().then(ping);
+</script></body></html>"""
+
+
+# ---------------------------------------------------------------------- server
+
+
+class EyesServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, addr, ssl_ctx, token, e2e_key=None, require_e2e=False):
+        super().__init__(addr, Handler)
+        self.ssl_ctx = ssl_ctx
+        self.token = token
+        self.e2e_key = e2e_key
+        self.require_e2e = require_e2e
+        self.gcm = GCM() if e2e_key else None
+        self.log_lock = threading.Lock()
+        self.last_log = 0.0
+        self.stamps = deque()  # frame timestamps for the rate limit
+
+    # TLS handshake happens here, in the per-connection thread — a port
+    # scanner or slow client can never stall the accept loop, and handshake
+    # failures are dropped silently.
+    def finish_request(self, request, client_address):
+        request.settimeout(15)
+        try:
+            tls = self.ssl_ctx.wrap_socket(request, server_side=True)
+        except OSError:
+            try:
+                request.close()
+            except OSError:
+                pass
+            return
+        tls.settimeout(60)
+        try:
+            self.RequestHandlerClass(tls, client_address, self)
+        finally:
+            try:
+                tls.close()
+            except OSError:
+                pass
+
+    def over_rate(self):
+        now = time.monotonic()
+        with self.log_lock:
+            while self.stamps and now - self.stamps[0] > 1.0:
+                self.stamps.popleft()
+            if len(self.stamps) >= MAX_FPS:
+                return True
+            self.stamps.append(now)
+            return False
+
+    def log(self, line, always=False):
+        with self.log_lock:
+            now = time.monotonic()
+            if always or now - self.last_log > 5:
+                print(line, flush=True)
+                self.last_log = now
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "eyes"
+    sys_version = ""
+
+    def log_message(self, fmt, *args):  # quiet; we log frames ourselves
+        pass
+
+    def _send(self, code, body, ctype="text/plain; charset=utf-8", extra=()):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in extra:
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    _DRAIN_CAP = 64 * 1024 * 1024
+
+    def _reject(self, n, code, body):
+        """Refuse a POST. The claimed body is drained (bounded) first —
+        responding while the client is still sending makes the closing socket
+        RST and the client never sees the status code."""
+        left = min(max(n, 0), self._DRAIN_CAP)
+        while left > 0:
+            chunk = self.rfile.read(min(left, 1 << 20))
+            if not chunk:
+                break
+            left -= len(chunk)
+        self.close_connection = True
+        self._send(code, body)
+
+    def _route(self):
+        """Returns the sub-path after a valid /<token> prefix, else None."""
+        path = self.path.split("?", 1)[0]
+        seg = path.split("/", 2)
+        if len(seg) >= 2 and hmac.compare_digest(seg[1], self.server.token):
+            return path[len(self.server.token) + 1:]  # "", "/", "/frame", ...
+        return None
+
+    def do_GET(self):
+        sub = self._route()
+        if sub is None:
+            return self._send(404, b"not found")
+        if sub == "":
+            return self._send(307, b"", extra=[("Location", self.path + "/")])
+        if sub == "/":
+            return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+        if sub == "/ping":
+            return self._send(200, b'{"ok":true}', "application/json")
+        if sub == "/ca":
+            with open(CA_CERT, "rb") as f:
+                return self._send(
+                    200, f.read(), "application/x-x509-ca-cert",
+                    extra=[("Content-Disposition",
+                            'attachment; filename="eyes-ca.pem"')],
+                )
+        if sub == "/latest.jpg":
+            if self.server.require_e2e:
+                # In remote mode this response would transit Cloudflare in
+                # the clear — the whole point is that frames never do.
+                return self._send(403, b"disabled in remote mode")
+            try:
+                with open(LATEST, "rb") as f:
+                    return self._send(200, f.read(), "image/jpeg")
+            except OSError:
+                return self._send(404, b"no frame yet")
+        return self._send(404, b"not found")
+
+    def do_POST(self):
+        sub = self._route()
+        try:
+            n = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            n = -1
+        if sub != "/frame":
+            return self._reject(n, 404, b"not found")
+        if n <= 0:
+            return self._reject(n, 411, b"length required")
+        if n > MAX_UPLOAD:
+            return self._reject(n, 413, b"frame too large")
+        if self.server.over_rate():
+            return self._reject(n, 429, b"slow down")
+        data = self.rfile.read(n)
+        if len(data) != n:
+            self.close_connection = True
+            return self._send(400, b"truncated body")
+
+        srv = self.server
+        if data.startswith(MAGIC):
+            if not srv.e2e_key:
+                return self._send(400, b"server has no e2e key")
+            iv, ct = data[4:16], data[16:]
+            data = srv.gcm.open(srv.e2e_key, iv, ct)
+            if data is None:
+                srv.log(
+                    f"DROPPED frame from {self.client_address[0]}: "
+                    "decryption failed (wrong key or tampered)", always=True,
+                )
+                return self._send(400, b"decrypt failed")
+        elif srv.require_e2e:
+            srv.log(
+                f"REFUSED plaintext frame from {self.client_address[0]} "
+                "(remote mode requires e2e encryption)", always=True,
+            )
+            return self._send(400, b"encryption required")
+
+        if not data.startswith(b"\xff\xd8"):
+            return self._send(400, b"not a jpeg")
+        save_frame(data)
+        srv.log(
+            f"frame from {self.client_address[0]} ({n / 1024:.0f} KB) -> {LATEST}"
+        )
+        self._send(200, b'{"ok":true}', "application/json")
+
+
+# ------------------------------------------------------------- cloudflared bits
+
+
+def cloudflared_bin():
+    return shutil.which("cloudflared") or os.path.expanduser(
+        "~/.local/bin/cloudflared"
+    )
+
+
+def _cfd(*args, **kw):
+    return subprocess.run(
+        (cloudflared_bin(),) + args, capture_output=True, text=True, **kw
+    )
+
+
+def tunnel_meta():
+    try:
+        return json.load(open(TUNNEL_META))
+    except (OSError, ValueError):
+        return {}
+
+
+def write_tunnel_yml(meta, ip, port):
+    """Ingress config: the tunnel terminates on this machine and forwards to
+    the local HTTPS server. noTLSVerify because the origin cert is our own
+    local CA — the hop is machine-internal (cloudflared runs right here)."""
+    yml = (
+        f"tunnel: {meta['id']}\n"
+        f"credentials-file: {meta['credentials']}\n"
+        "ingress:\n"
+        f"  - hostname: {meta['hostname']}\n"
+        f"    service: https://{ip}:{port}\n"
+        "    originRequest:\n"
+        "      noTLSVerify: true\n"
+        "  - service: http_status:404\n"
+    )
+    changed = not (os.path.exists(TUNNEL_YML) and open(TUNNEL_YML).read() == yml)
+    if changed:
+        with open(TUNNEL_YML, "w") as f:
+            f.write(yml)
+    return changed
+
+
+def systemctl_user(*args):
+    return subprocess.run(
+        ("systemctl", "--user") + args, capture_output=True, text=True
+    )
+
+
+def tunnel_active():
+    return systemctl_user("is-active", UNIT_NAME).stdout.strip() == "active"
+
+
+def cmd_tunnel_setup(args):
+    ensure_state()
+    if not os.path.exists(cloudflared_bin()):
+        sys.exit(
+            "eyes: cloudflared not found. Install the static binary into "
+            "~/.local/bin (see README — verify the checksum)."
+        )
+    origin_cert = os.path.expanduser("~/.cloudflared/cert.pem")
+    if not os.path.exists(origin_cert):
+        sys.exit(
+            "eyes: cloudflared is not logged in yet. Run this once (opens a "
+            "browser, pick the zone your hostname lives under):\n\n"
+            "    cloudflared tunnel login\n\n"
+            "then re-run:  eyes tunnel setup " + args.hostname
+        )
+    name = "eyes"
+    r = _cfd("tunnel", "list", "--output", "json")
+    if r.returncode != 0:
+        sys.exit("eyes: cloudflared tunnel list failed:\n" + r.stderr.strip())
+    existing = {t["name"]: t["id"] for t in json.loads(r.stdout or "[]")}
+    if name in existing:
+        tid = existing[name]
+        print(f"tunnel '{name}' already exists ({tid})")
+    else:
+        r = _cfd("tunnel", "create", name)
+        if r.returncode != 0:
+            sys.exit("eyes: tunnel create failed:\n" + r.stderr.strip())
+        r = _cfd("tunnel", "list", "--output", "json")
+        tid = {t["name"]: t["id"] for t in json.loads(r.stdout)}[name]
+        print(f"created tunnel '{name}' ({tid})")
+    creds = os.path.expanduser(f"~/.cloudflared/{tid}.json")
+    if not os.path.exists(creds):
+        sys.exit(f"eyes: expected credentials file missing: {creds}")
+
+    r = _cfd("tunnel", "route", "dns", name, args.hostname)
+    out = (r.stdout + r.stderr).strip()
+    if r.returncode != 0 and "already exists" not in out.lower():
+        sys.exit(f"eyes: DNS routing failed for {args.hostname}:\n{out}")
+    print(f"DNS: {args.hostname} -> {tid}.cfargotunnel.com")
+
+    meta = {
+        "name": name, "id": tid, "credentials": creds, "hostname": args.hostname,
+    }
+    with open(TUNNEL_META, "w") as f:
+        json.dump(meta, f, indent=1)
+    write_tunnel_yml(meta, lan_ip() or "127.0.0.1", args.port)
+
+    os.makedirs(os.path.dirname(UNIT_FILE), exist_ok=True)
+    with open(UNIT_FILE, "w") as f:
+        f.write(
+            "[Unit]\n"
+            "Description=eyes cloudflare tunnel (opt-in remote access)\n"
+            "After=network-online.target\n\n"
+            "[Service]\n"
+            f"ExecStart={cloudflared_bin()} --no-autoupdate tunnel "
+            f"--config {TUNNEL_YML} run\n"
+            "Restart=on-failure\n"
+            "RestartSec=5\n\n"
+            "[Install]\n"
+            "WantedBy=default.target\n"
+        )
+    systemctl_user("daemon-reload")
+    print(f"""
+tunnel is configured but NOT running (remote access stays opt-in).
+
+  start it:   eyes tunnel up
+  stop it:    eyes tunnel down
+  serve for it: eyes serve --remote
+
+STRONGLY RECOMMENDED — put Cloudflare Access in front (login wall before
+anything reaches this machine): dash.cloudflare.com -> Zero Trust -> Access
+-> Applications -> Add self-hosted app for {args.hostname}, policy = Allow,
+include = your email, login method = One-time PIN. Details in the README.""")
+
+
+def cmd_tunnel_up(args):
+    if not tunnel_meta():
+        sys.exit("eyes: no tunnel configured. Run: eyes tunnel setup HOSTNAME")
+    systemctl_user("daemon-reload")
+    r = systemctl_user("start", UNIT_NAME)
+    if r.returncode != 0:
+        sys.exit("eyes: failed to start tunnel:\n" + r.stderr.strip())
+    print("tunnel up — remember: eyes serve --remote  (plain `serve` refuses "
+          "unencrypted remote frames anyway)")
+
+
+def cmd_tunnel_down(args):
+    systemctl_user("stop", UNIT_NAME)
+    print("tunnel down — nothing is reachable from outside your LAN now")
+
+
+def cmd_tunnel_status(args):
+    meta = tunnel_meta()
+    if not meta:
+        print("tunnel: not configured (eyes tunnel setup HOSTNAME)")
+        return 1
+    state = systemctl_user("is-active", UNIT_NAME).stdout.strip() or "unknown"
+    print(f"tunnel:   {meta['name']} ({meta['id']})")
+    print(f"hostname: https://{meta['hostname']}/")
+    print(f"state:    {state}")
+    return 0 if state == "active" else 1
+
+
+# ------------------------------------------------------------------- commands
+
+
+def cmd_serve(args):
+    ensure_state()
+    ip = args.bind or lan_ip()
+    if not ip:
+        sys.exit("eyes: could not determine LAN address; pass --bind IP")
+    import ipaddress
+    if not ipaddress.ip_address(ip).is_private:
+        sys.exit(
+            f"eyes: refusing to bind {ip} — not a private address. Remote "
+            "access is done via `eyes tunnel`, never by binding public IPs."
+        )
+    token = get_token(fresh=args.fresh_token)
+    meta = tunnel_meta()
+    if args.remote and not meta:
+        sys.exit("eyes: remote mode needs a tunnel. Run: eyes tunnel setup "
+                 "HOSTNAME  (see README)")
+    # E2E key: required for remote; reused on the LAN too once it exists so
+    # one bookmarked URL (with #k=…) works in both modes.
+    e2e_key = get_e2e_key(create=args.remote)
+    if ensure_ca():
+        print("generated local CA (once ever) -> " + CA_CERT)
+    if ensure_leaf(ip):
+        print(f"issued server certificate for {ip}")
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(CHAIN, LEAF_KEY)
+    gc(quiet=True)
+
+    srv = EyesServer((ip, args.port), ctx, token,
+                     e2e_key=e2e_key, require_e2e=args.remote)
+    frag = f"#k={b64u(e2e_key)}" if e2e_key else ""
+    lan_url = f"https://{ip}:{args.port}/{token}/{frag}"
+    print("\neyes is watching for frames.\n")
+    if args.remote:
+        remote_url = f"https://{meta['hostname']}/{token}/{frag}"
+        print(f"  phone (anywhere): {remote_url}\n")
+        print(f"  phone (same LAN): {lan_url}")
+        print("  frames are end-to-end encrypted — the key after '#' never "
+              "leaves the phone/this machine (URL fragments are not sent "
+              "over the network). Cloudflare relays ciphertext only.")
+        if write_tunnel_yml(meta, ip, args.port) and tunnel_active():
+            print("  NOTE: tunnel config changed (IP/port) — restart it: "
+                  "eyes tunnel down && eyes tunnel up")
+        if not tunnel_active():
+            print("  NOTE: tunnel is not running — start it: eyes tunnel up")
+    else:
+        print(f"  open on the phone:  {lan_url}")
+    print(f"""
+  latest frame:  {LATEST}
+  history:       {HISTORY}  (capped: {KEEP_COUNT} frames / {KEEP_BYTES // 2**20} MB)
+
+first time on this phone via LAN? the page walks you through the one-time
+certificate install. the URL stays the same across restarts — add it to the
+Home Screen. Ctrl-C to stop.""", flush=True)
+    if shutil.which("qrencode"):
+        subprocess.run(["qrencode", "-t", "ANSIUTF8",
+                        remote_url if args.remote else lan_url])
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\neyes: stopped")
+
+
+def cmd_latest(args):
+    if os.path.exists(LATEST):
+        print(LATEST)
+        return 0
+    print("eyes: no frame captured yet", file=sys.stderr)
+    return 1
+
+
+def cmd_wait(args):
+    def mtime():
+        try:
+            return os.stat(LATEST).st_mtime_ns
+        except OSError:
+            return None
+
+    before = mtime()
+    deadline = time.monotonic() + args.timeout if args.timeout else None
+    while True:
+        time.sleep(0.15)
+        m = mtime()
+        if m is not None and m != before:
+            print(LATEST)
+            return 0
+        if deadline and time.monotonic() > deadline:
+            print("eyes: timed out waiting for a frame", file=sys.stderr)
+            return 1
+
+
+def cmd_gc(args):
+    ensure_state()
+    n = gc(args.keep, args.max_mb * 1024 * 1024)
+    print(f"eyes: removed {n} frame(s)" if n else "eyes: nothing to prune")
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="eyes", description="phone camera -> frames on disk, local-first"
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("serve", help="start the HTTPS server")
+    s.add_argument("--port", type=int, default=8443)
+    s.add_argument("--bind", help="LAN IP to bind (default: auto-detect)")
+    s.add_argument("--remote", action="store_true",
+                   help="serve for the Cloudflare tunnel too; requires e2e-"
+                        "encrypted frames and refuses plaintext")
+    s.add_argument("--fresh-token", action="store_true",
+                   help="rotate the URL token (invalidates the old URL)")
+    s.set_defaults(fn=cmd_serve)
+
+    s = sub.add_parser("latest", help="print path of the newest frame")
+    s.set_defaults(fn=cmd_latest)
+
+    s = sub.add_parser("wait", help="block until a new frame arrives")
+    s.add_argument("--timeout", type=float, default=None, metavar="SECS")
+    s.set_defaults(fn=cmd_wait)
+
+    s = sub.add_parser("gc", help="prune frame history")
+    s.add_argument("--keep", type=int, default=KEEP_COUNT,
+                   help=f"max frames to keep (default {KEEP_COUNT})")
+    s.add_argument("--max-mb", type=int, default=KEEP_BYTES // 2**20,
+                   help="max total MB of history")
+    s.set_defaults(fn=cmd_gc)
+
+    t = sub.add_parser("tunnel", help="opt-in remote access (Cloudflare Tunnel)")
+    tsub = t.add_subparsers(dest="tcmd", required=True)
+    s = tsub.add_parser("setup", help="one-time: create tunnel + DNS + unit")
+    s.add_argument("hostname", help="e.g. eyes.example.dev")
+    s.add_argument("--port", type=int, default=8443)
+    s.set_defaults(fn=cmd_tunnel_setup)
+    tsub.add_parser("up", help="start the tunnel").set_defaults(fn=cmd_tunnel_up)
+    tsub.add_parser("down", help="stop the tunnel").set_defaults(fn=cmd_tunnel_down)
+    tsub.add_parser("status", help="tunnel state").set_defaults(fn=cmd_tunnel_status)
+
+    args = p.parse_args()
+    sys.exit(args.fn(args) or 0)
+
+
+if __name__ == "__main__":
+    main()
