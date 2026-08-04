@@ -1,13 +1,36 @@
 # eyes
 
-Give a terminal AI agent (or anything that can read a file) live eyes:
-point your phone camera at the world and frames land on this machine as
-plain JPEGs at a stable path.
+Point your phone camera at anything; frames land on disk for your terminal AI agent.
+
+<p align="center">
+  <img src="assets/demo.svg" alt="eyes demo: phone snaps a photo, the frame travels over an encrypted link to the terminal, the agent describes it" width="840">
+</p>
 
 No app, no App Store, no cloud storage, no third-party relay by default.
-One Python file, zero pip dependencies. The phone side is a single
-self-contained web page — open it in Safari, tap **SNAP** or toggle
-**Stream** (~2 fps, adjustable).
+The phone side is a single self-contained web page — open it in Safari, tap
+**SNAP** or toggle **Stream** (~2 fps, adjustable). Frames arrive on this
+machine as plain JPEGs at a stable path, replaced atomically.
+
+## Why this instead of X
+
+* **Agent-agnostic by design.** The contract is a file path, not a
+  protocol: any agent that can read `~/.local/state/eyes/latest.jpg` has
+  eyes — Claude Code, aider, a cron job, `cat`. No MCP required. (An
+  `eyes mcp` stdio server is included for MCP-only clients like Claude
+  Desktop — see below.)
+* **One Python file, zero pip dependencies.** `curl` it, `chmod +x`, done.
+  Nothing to `pip install`, no venv, no node_modules.
+* **The iOS camera problem, actually solved.** iOS Safari refuses
+  `getUserMedia` on self-signed certs even after you tap through the
+  warning. `eyes` ships its own tiny local CA and walks you through
+  trusting it once (~60 seconds); after that the camera just works, and
+  cert renewals on IP change are automatic.
+* **Remote mode is end-to-end encrypted, not "trust the relay".** Frames
+  are AES-256-GCM ciphertext in the browser before they leave the phone;
+  the key rides in the URL fragment, which browsers never send over the
+  network — Cloudflare relays bytes it cannot read.
+
+## Quick start
 
 ```sh
 eyes serve                  # LAN mode — nothing leaves your network
@@ -181,14 +204,37 @@ eyes wait --timeout 120
 eyes gc --keep 50  # prints every removed file before removing it
 ```
 
+## MCP (optional)
+
+The file path is the primary interface and always will be. But some
+clients (Claude Desktop, for one) can *only* talk to tools over MCP, so
+`eyes mcp` runs a minimal MCP server on stdio — same single file, still
+zero dependencies. Register it:
+
+```sh
+claude mcp add -s user eyes -- /path/to/eyes mcp
+```
+
+(or point any MCP client's stdio config at `/path/to/eyes mcp`.)
+
+Two tools:
+
+* `eyes_latest` — returns the newest frame as an image, or an error if
+  none has been captured yet.
+* `eyes_wait` — blocks until the human captures a **new** frame, then
+  returns it (`timeout_secs`, default 120).
+
+`eyes serve` still does the capturing; `eyes mcp` only reads what it wrote
+to disk. If your agent can read files, you don't need this.
+
 ## Tests
 
-`python3 test_eyes.py` — 35 headless checks against a throwaway state dir:
+`python3 test_eyes.py` — 42 headless checks against a throwaway state dir:
 the AES-256-GCM binding against a published test vector, WebCrypto interop
 (Node encrypts exactly as the phone page does, Python decrypts), token /
 size / rate-limit / plaintext-refusal rejections, atomicity of `latest.jpg`
-under concurrent reads, and the CLI. What it *cannot* cover: a physical
-iPhone and a live tunnel.
+under concurrent reads, the CLI, and the MCP stdio server. What it
+*cannot* cover: a physical iPhone and a live tunnel.
 
 ## License
 
