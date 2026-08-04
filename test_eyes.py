@@ -228,6 +228,44 @@ def main():
           all(("#k=" in line) == ("k=" in line.split("#")[0] + "#k=" and "#k=" in line)
               for line in out.splitlines() if "#k=" in line))
 
+    # ---- 7. mcp server on stdio
+    mcp = subprocess.Popen([EYES, "mcp"], env=os.environ, stdin=subprocess.PIPE,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    def rpc(msg):
+        mcp.stdin.write(json.dumps(msg) + "\n"); mcp.stdin.flush()
+        return json.loads(mcp.stdout.readline())
+    try:
+        r = rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params":
+                 {"protocolVersion": "2025-06-18", "capabilities": {},
+                  "clientInfo": {"name": "test", "version": "0"}}})
+        check("mcp: initialize handshake",
+              r["result"]["serverInfo"]["name"] == "eyes"
+              and r["result"]["protocolVersion"] == "2025-06-18")
+        mcp.stdin.write(json.dumps({"jsonrpc": "2.0",
+            "method": "notifications/initialized"}) + "\n"); mcp.stdin.flush()
+        r = rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+        check("mcp: tools/list has eyes_latest + eyes_wait",
+              [t["name"] for t in r["result"]["tools"]] == ["eyes_latest", "eyes_wait"])
+        r = rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                 "params": {"name": "eyes_latest", "arguments": {}}})
+        img = next(c for c in r["result"]["content"] if c["type"] == "image")
+        raw = base64.b64decode(img["data"])
+        check("mcp: eyes_latest returns the frame as base64 image",
+              not r["result"]["isError"] and img["mimeType"] == "image/jpeg"
+              and raw[:2] == b"\xff\xd8" and raw[-2:] == b"\xff\xd9")
+        r = rpc({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                 "params": {"name": "eyes_wait", "arguments": {"timeout_secs": 1}}})
+        check("mcp: eyes_wait times out as tool error (not a crash)",
+              r["result"]["isError"] and "timed out" in r["result"]["content"][0]["text"])
+        r = rpc({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                 "params": {"name": "nope", "arguments": {}}})
+        check("mcp: unknown tool -> JSON-RPC error", r["error"]["code"] == -32602)
+        r = rpc({"jsonrpc": "2.0", "id": 6, "method": "bogus/method"})
+        check("mcp: unknown method -> -32601", r["error"]["code"] == -32601)
+    finally:
+        mcp.stdin.close(); mcp.wait(timeout=5)
+    check("mcp: clean exit on stdin close", mcp.returncode == 0)
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         print("FAILED:", FAIL)

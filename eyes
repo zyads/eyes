@@ -972,6 +972,146 @@ def cmd_gc(args):
     return 0
 
 
+# ------------------------------------------------------------------ mcp
+
+MCP_TOOLS = [
+    {
+        "name": "eyes_latest",
+        "description": (
+            "Return the newest frame from the human's phone camera as an "
+            "image (or an error if none captured yet). Frames arrive when "
+            "the human taps SNAP or streams on the eyes phone page; "
+            "`eyes serve` must be running for new frames to land."
+        ),
+        "inputSchema": {
+            "type": "object", "properties": {}, "additionalProperties": False,
+        },
+    },
+    {
+        "name": "eyes_wait",
+        "description": (
+            "Block until the human captures a NEW frame, then return it as "
+            "an image. Ask the human to point the phone at the thing first. "
+            "Errors after timeout_secs (default 120) if no frame arrives."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "timeout_secs": {
+                    "type": "number", "minimum": 1, "maximum": 3600,
+                    "description": "seconds to wait before giving up",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+]
+
+
+def _mcp_frame_result():
+    data = open(LATEST, "rb").read()
+    age = max(0.0, time.time() - os.stat(LATEST).st_mtime)
+    return {
+        "content": [
+            {"type": "image", "data": base64.b64encode(data).decode(),
+             "mimeType": "image/jpeg"},
+            {"type": "text",
+             "text": f"{LATEST} ({len(data)} bytes, {age:.1f}s old)"},
+        ],
+        "isError": False,
+    }
+
+
+def _mcp_tool_error(msg):
+    return {"content": [{"type": "text", "text": msg}], "isError": True}
+
+
+def _mcp_call(name, arguments):
+    """Run one tool call; returns a tools/call result, or None if the tool
+    name is unknown."""
+    if name == "eyes_latest":
+        if not os.path.exists(LATEST):
+            return _mcp_tool_error(
+                "no frame captured yet — is `eyes serve` running, and has "
+                "the human taken a photo?")
+        return _mcp_frame_result()
+    if name == "eyes_wait":
+        try:
+            timeout = min(3600.0, max(1.0, float(arguments.get("timeout_secs") or 120)))
+        except (TypeError, ValueError):
+            return _mcp_tool_error("timeout_secs must be a number")
+        try:
+            before = os.stat(LATEST).st_mtime_ns
+        except OSError:
+            before = None
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(0.15)
+            try:
+                m = os.stat(LATEST).st_mtime_ns
+            except OSError:
+                continue
+            if m != before:
+                return _mcp_frame_result()
+        return _mcp_tool_error(
+            f"timed out after {timeout:.0f}s — no new frame arrived. Is "
+            "`eyes serve` running, and did the human take a photo?")
+    return None
+
+
+def cmd_mcp(args):
+    """MCP server over stdio: newline-delimited JSON-RPC 2.0, stdlib only.
+
+    The file-path contract (`eyes latest` / `eyes wait`) stays the primary
+    interface; this exists for clients that can only speak MCP (Claude
+    Desktop and friends). One request is handled at a time — eyes_wait
+    blocks the loop, which is the intended UX (the agent is waiting on the
+    human's photo anyway).
+    """
+    ensure_state()
+
+    def send(obj):
+        sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            send({"jsonrpc": "2.0", "id": None,
+                  "error": {"code": -32700, "message": "parse error"}})
+            continue
+        mid, method = msg.get("id"), msg.get("method")
+        params = msg.get("params") or {}
+        if method == "initialize":
+            send({"jsonrpc": "2.0", "id": mid, "result": {
+                "protocolVersion": params.get("protocolVersion") or "2025-06-18",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "eyes", "version": "1.0.0"},
+            }})
+        elif method == "tools/list":
+            send({"jsonrpc": "2.0", "id": mid, "result": {"tools": MCP_TOOLS}})
+        elif method == "tools/call":
+            res = _mcp_call(params.get("name"), params.get("arguments") or {})
+            if res is None:
+                send({"jsonrpc": "2.0", "id": mid, "error": {
+                    "code": -32602,
+                    "message": "unknown tool: %s" % params.get("name")}})
+            else:
+                send({"jsonrpc": "2.0", "id": mid, "result": res})
+        elif method == "ping":
+            send({"jsonrpc": "2.0", "id": mid, "result": {}})
+        elif mid is not None:
+            send({"jsonrpc": "2.0", "id": mid, "error": {
+                "code": -32601, "message": "method not found: %s" % method}})
+        # notifications we don't handle (e.g. notifications/initialized)
+        # are ignored, as JSON-RPC requires
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(
         prog="eyes", description="phone camera -> frames on disk, local-first"
@@ -1001,6 +1141,9 @@ def main():
     s.add_argument("--max-mb", type=int, default=KEEP_BYTES // 2**20,
                    help="max total MB of history")
     s.set_defaults(fn=cmd_gc)
+
+    s = sub.add_parser("mcp", help="MCP server on stdio (for MCP-only clients)")
+    s.set_defaults(fn=cmd_mcp)
 
     t = sub.add_parser("tunnel", help="opt-in remote access (Cloudflare Tunnel)")
     tsub = t.add_subparsers(dest="tcmd", required=True)
